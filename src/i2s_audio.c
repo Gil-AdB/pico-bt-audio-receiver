@@ -1,5 +1,5 @@
 // i2s_audio.c - I2S audio output for PCM5102A DAC
-// Uses DMA chaining for gapless audio playback
+// Hybrid architecture: Ring Buffer (input) + DMA Double Buffer (output)
 
 #include "i2s_audio.h"
 #include "audio_i2s.pio.h"
@@ -7,9 +7,9 @@
 #include "hardware/dma.h"
 #include "hardware/irq.h"
 #include "hardware/pio.h"
+#include "hardware/sync.h"
 #include "pico/stdlib.h"
 #include <math.h>
-#include <stdio.h>
 #include <string.h>
 
 // ============================================================================
@@ -17,59 +17,95 @@
 // ============================================================================
 #define AUDIO_PIO pio0
 
-// Audio Buffers - ping-pong with DMA chaining
-#define BUFFER_SAMPLES 1024 // ~23ms at 44.1kHz
-static uint32_t buffer_a[BUFFER_SAMPLES];
-static uint32_t buffer_b[BUFFER_SAMPLES];
+// Ring Buffer - absorbs Bluetooth jitter (~180ms at 44.1kHz stereo)
+#define RING_BUFFER_SIZE (16 * 1024) // 16KB = 4096 stereo samples
+static uint32_t ring_buffer[RING_BUFFER_SIZE / sizeof(uint32_t)];
+static volatile uint32_t ring_head = 0; // Write position
+static volatile uint32_t ring_tail = 0; // Read position
 
-// Write state - simple: just track position in the buffer we're filling
-static volatile int write_buf_idx;  // 0 = filling A, 1 = filling B
-static volatile uint32_t write_pos; // Position in current write buffer
+// DMA Double Buffer - gapless output
+#define DMA_BUFFER_SAMPLES 1024 // ~23ms per buffer at 44.1kHz
+static uint32_t dma_buffer_a[DMA_BUFFER_SAMPLES];
+static uint32_t dma_buffer_b[DMA_BUFFER_SAMPLES];
 
-// DMA channels - two channels chained together
+// DMA channels
 static int dma_chan_a;
 static int dma_chan_b;
 
+// PIO state
 static uint audio_sm;
 static uint audio_offset;
-static volatile bool active;
+static volatile bool active = false;
 static uint32_t sample_freq = 44100;
 
-// Stats
-static volatile uint32_t irq_count_a = 0;
-static volatile uint32_t irq_count_b = 0;
+// ============================================================================
+// Ring Buffer Operations (lock-free single producer, single consumer)
+// ============================================================================
+#define RING_MASK ((RING_BUFFER_SIZE / sizeof(uint32_t)) - 1)
 
-// Forward declarations
-static void dma_irq_handler(void);
-static void fill_buffer_with_silence(uint32_t *buf, uint32_t count);
+static inline uint32_t ring_available(void) {
+  return (ring_head - ring_tail) & RING_MASK;
+}
+
+static inline uint32_t ring_free(void) { return RING_MASK - ring_available(); }
+
+static void ring_write(const uint32_t *data, uint32_t count) {
+  for (uint32_t i = 0; i < count; i++) {
+    ring_buffer[ring_head] = data[i];
+    ring_head = (ring_head + 1) & RING_MASK;
+  }
+}
+
+static void ring_read(uint32_t *dest, uint32_t count) {
+  for (uint32_t i = 0; i < count; i++) {
+    dest[i] = ring_buffer[ring_tail];
+    ring_tail = (ring_tail + 1) & RING_MASK;
+  }
+}
+
+static void ring_clear(void) {
+  ring_head = 0;
+  ring_tail = 0;
+}
 
 // ============================================================================
-// DMA IRQ Handler - buffer just finished, the OTHER is already playing
+// DMA IRQ Handler - Pull from ring buffer into just-finished DMA buffer
 // ============================================================================
 static void __isr __time_critical_func(dma_irq_handler)(void) {
-  // Check which channel finished
+  uint32_t *buffer_to_fill = NULL;
+
   if (dma_irqn_get_channel_status(0, dma_chan_a)) {
     dma_irqn_acknowledge_channel(0, dma_chan_a);
-    irq_count_a++;
-    // Buffer A just finished. Buffer B is now playing (automatically chained).
-    // We should now be filling Buffer A for the NEXT round.
-    // Reset the DMA read address back to buffer_a for when it chains back.
-    dma_channel_set_read_addr(dma_chan_a, buffer_a, false);
+    buffer_to_fill = dma_buffer_a;
+    // Reset read address for next time this channel plays
+    dma_channel_set_read_addr(dma_chan_a, dma_buffer_a, false);
   }
 
   if (dma_irqn_get_channel_status(0, dma_chan_b)) {
     dma_irqn_acknowledge_channel(0, dma_chan_b);
-    irq_count_b++;
-    // Buffer B just finished. Buffer A is now playing (automatically chained).
-    // Reset the DMA read address back to buffer_b for when it chains back.
-    dma_channel_set_read_addr(dma_chan_b, buffer_b, false);
+    buffer_to_fill = dma_buffer_b;
+    dma_channel_set_read_addr(dma_chan_b, dma_buffer_b, false);
+  }
+
+  if (buffer_to_fill) {
+    uint32_t available = ring_available();
+    if (available >= DMA_BUFFER_SAMPLES) {
+      ring_read(buffer_to_fill, DMA_BUFFER_SAMPLES);
+    } else if (available > 0) {
+      // Partial fill + silence
+      ring_read(buffer_to_fill, available);
+      memset(&buffer_to_fill[available], 0,
+             (DMA_BUFFER_SAMPLES - available) * sizeof(uint32_t));
+    } else {
+      // Underrun - fill with silence
+      memset(buffer_to_fill, 0, DMA_BUFFER_SAMPLES * sizeof(uint32_t));
+    }
   }
 }
 
-static void fill_buffer_with_silence(uint32_t *buf, uint32_t count) {
-  memset(buf, 0, count * sizeof(uint32_t));
-}
-
+// ============================================================================
+// PIO Clock Configuration
+// ============================================================================
 static void update_pio_frequency(uint32_t freq) {
   uint32_t system_clock_frequency = clock_get_hz(clk_sys);
   uint32_t divider = system_clock_frequency * 4 / freq;
@@ -78,16 +114,20 @@ static void update_pio_frequency(uint32_t freq) {
   sample_freq = freq;
 }
 
+void i2s_audio_set_sample_rate(uint32_t rate) {
+  if (rate == 44100 || rate == 48000) {
+    update_pio_frequency(rate);
+  }
+}
+
 // ============================================================================
 // Initialization
 // ============================================================================
 void i2s_audio_init(void) {
   // Clear buffers
-  fill_buffer_with_silence(buffer_a, BUFFER_SAMPLES);
-  fill_buffer_with_silence(buffer_b, BUFFER_SAMPLES);
-
-  write_buf_idx = 0;
-  write_pos = 0;
+  ring_clear();
+  memset(dma_buffer_a, 0, sizeof(dma_buffer_a));
+  memset(dma_buffer_b, 0, sizeof(dma_buffer_b));
   active = false;
 
   // Initialize GPIO pins for PIO
@@ -101,7 +141,7 @@ void i2s_audio_init(void) {
   audio_i2s_program_init(AUDIO_PIO, audio_sm, audio_offset, I2S_DATA_PIN,
                          I2S_BCK_PIN);
 
-  // Set clock divider for 44.1kHz
+  // Set default clock divider
   update_pio_frequency(44100);
 
   // ========================================================================
@@ -116,13 +156,10 @@ void i2s_audio_init(void) {
   channel_config_set_read_increment(&cfg_a, true);
   channel_config_set_write_increment(&cfg_a, false);
   channel_config_set_dreq(&cfg_a, pio_get_dreq(AUDIO_PIO, audio_sm, true));
-  channel_config_set_chain_to(&cfg_a, dma_chan_b); // Chain to B when done
+  channel_config_set_chain_to(&cfg_a, dma_chan_b);
 
-  dma_channel_configure(dma_chan_a, &cfg_a,
-                        &AUDIO_PIO->txf[audio_sm], // dest: PIO TX FIFO
-                        buffer_a,                  // src: buffer A
-                        BUFFER_SAMPLES,            // count
-                        false);                    // don't start yet
+  dma_channel_configure(dma_chan_a, &cfg_a, &AUDIO_PIO->txf[audio_sm],
+                        dma_buffer_a, DMA_BUFFER_SAMPLES, false);
 
   // Configure Channel B
   dma_channel_config cfg_b = dma_channel_get_default_config(dma_chan_b);
@@ -130,15 +167,12 @@ void i2s_audio_init(void) {
   channel_config_set_read_increment(&cfg_b, true);
   channel_config_set_write_increment(&cfg_b, false);
   channel_config_set_dreq(&cfg_b, pio_get_dreq(AUDIO_PIO, audio_sm, true));
-  channel_config_set_chain_to(&cfg_b, dma_chan_a); // Chain to A when done
+  channel_config_set_chain_to(&cfg_b, dma_chan_a);
 
-  dma_channel_configure(dma_chan_b, &cfg_b,
-                        &AUDIO_PIO->txf[audio_sm], // dest: PIO TX FIFO
-                        buffer_b,                  // src: buffer B
-                        BUFFER_SAMPLES,            // count
-                        false);                    // don't start yet
+  dma_channel_configure(dma_chan_b, &cfg_b, &AUDIO_PIO->txf[audio_sm],
+                        dma_buffer_b, DMA_BUFFER_SAMPLES, false);
 
-  // Enable IRQs for both channels
+  // Enable IRQs
   irq_add_shared_handler(DMA_IRQ_0, dma_irq_handler,
                          PICO_SHARED_IRQ_HANDLER_DEFAULT_ORDER_PRIORITY);
   dma_irqn_set_channel_enabled(0, dma_chan_a, true);
@@ -147,34 +181,26 @@ void i2s_audio_init(void) {
 }
 
 // ============================================================================
-// Audio Write - fill the buffer that's NOT currently playing
+// Audio Write - Push to ring buffer (never blocks)
 // ============================================================================
 uint32_t i2s_audio_write(const int16_t *samples, uint32_t num_samples) {
   if (!active)
     return 0;
 
-  // Get the buffer we're writing to
-  uint32_t *buf = (write_buf_idx == 0) ? buffer_a : buffer_b;
-
-  // Calculate space available
-  uint32_t space = BUFFER_SAMPLES - write_pos;
-  uint32_t pairs = num_samples / 2; // stereo pairs
-  if (pairs > space)
-    pairs = space;
+  uint32_t pairs = num_samples / 2;
+  uint32_t free = ring_free();
+  if (pairs > free)
+    pairs = free;
   if (pairs == 0)
     return 0;
 
-  // Write samples
+  // Pack and write to ring buffer
   for (uint32_t i = 0; i < pairs; i++) {
     int16_t left = samples[i * 2];
     int16_t right = samples[i * 2 + 1];
-    buf[write_pos++] = ((uint32_t)(uint16_t)left << 16) | (uint16_t)right;
-  }
-
-  // If buffer is full, switch to the other one
-  if (write_pos >= BUFFER_SAMPLES) {
-    write_buf_idx = 1 - write_buf_idx;
-    write_pos = 0;
+    uint32_t packed = ((uint32_t)(uint16_t)left << 16) | (uint16_t)right;
+    ring_buffer[ring_head] = packed;
+    ring_head = (ring_head + 1) & RING_MASK;
   }
 
   return pairs * 2;
@@ -183,7 +209,7 @@ uint32_t i2s_audio_write(const int16_t *samples, uint32_t num_samples) {
 uint32_t i2s_audio_get_free_samples(void) {
   if (!active)
     return 0;
-  return (BUFFER_SAMPLES - write_pos) * 2;
+  return ring_free() * 2; // Stereo samples
 }
 
 // ============================================================================
@@ -193,23 +219,19 @@ void i2s_audio_start(void) {
   if (!active) {
     active = true;
 
-    // Clear buffers
-    fill_buffer_with_silence(buffer_a, BUFFER_SAMPLES);
-    fill_buffer_with_silence(buffer_b, BUFFER_SAMPLES);
-
-    write_buf_idx = 0;
-    write_pos = 0;
-    irq_count_a = 0;
-    irq_count_b = 0;
+    // Clear everything
+    ring_clear();
+    memset(dma_buffer_a, 0, sizeof(dma_buffer_a));
+    memset(dma_buffer_b, 0, sizeof(dma_buffer_b));
 
     // Reset DMA read addresses
-    dma_channel_set_read_addr(dma_chan_a, buffer_a, false);
-    dma_channel_set_read_addr(dma_chan_b, buffer_b, false);
+    dma_channel_set_read_addr(dma_chan_a, dma_buffer_a, false);
+    dma_channel_set_read_addr(dma_chan_b, dma_buffer_b, false);
 
-    // Enable PIO state machine
+    // Enable PIO
     pio_sm_set_enabled(AUDIO_PIO, audio_sm, true);
 
-    // Start DMA chain by triggering channel A
+    // Start DMA chain
     dma_channel_start(dma_chan_a);
   }
 }
@@ -217,12 +239,8 @@ void i2s_audio_start(void) {
 void i2s_audio_stop(void) {
   if (active) {
     active = false;
-
-    // Abort both DMA channels
     dma_channel_abort(dma_chan_a);
     dma_channel_abort(dma_chan_b);
-
-    // Disable PIO
     pio_sm_set_enabled(AUDIO_PIO, audio_sm, false);
   }
 }
@@ -233,7 +251,6 @@ bool i2s_audio_is_active(void) { return active; }
 // Test Tone - Pleasant Sine Wave
 // ============================================================================
 void i2s_play_test_tone(void) {
-// Generate 440Hz sine wave lookup table
 #define SINE_TABLE_SIZE 100
   static int16_t sine_table[SINE_TABLE_SIZE];
   static bool table_generated = false;
@@ -241,23 +258,27 @@ void i2s_play_test_tone(void) {
   if (!table_generated) {
     for (int i = 0; i < SINE_TABLE_SIZE; i++) {
       sine_table[i] =
-          (int16_t)(16000.0f * sinf(2.0f * 3.14159265f * i / SINE_TABLE_SIZE));
+          (int16_t)(12000.0f * sinf(2.0f * 3.14159265f * i / SINE_TABLE_SIZE));
     }
     table_generated = true;
   }
 
-  // Pre-fill both buffers with sine wave
-  for (uint32_t i = 0; i < BUFFER_SAMPLES; i++) {
-    int16_t value = sine_table[i % SINE_TABLE_SIZE];
-    buffer_a[i] = ((uint32_t)(uint16_t)value << 16) | (uint16_t)value;
-    buffer_b[i] = buffer_a[i];
-  }
-
   i2s_audio_start();
 
-  // Play for 1 second (sine wave already in both buffers, DMA will loop)
-  sleep_ms(1000);
+  // Fill ring buffer with sine wave, let it play for 1 second
+  int16_t stereo_samples[200];
+  for (int chunk = 0; chunk < 441; chunk++) { // ~1 second at 44.1kHz
+    for (int i = 0; i < 100; i++) {
+      stereo_samples[i * 2] = sine_table[i];
+      stereo_samples[i * 2 + 1] = sine_table[i];
+    }
+    while (i2s_audio_get_free_samples() < 200) {
+      tight_loop_contents();
+    }
+    i2s_audio_write(stereo_samples, 200);
+  }
 
+  sleep_ms(100); // Let buffer drain
   i2s_audio_stop();
 }
 
@@ -265,12 +286,10 @@ void i2s_play_test_tone(void) {
 // Direct Test (bypass DMA for debugging)
 // ============================================================================
 void i2s_direct_test(void) {
-  // Enable PIO
   pio_sm_set_enabled(AUDIO_PIO, audio_sm, true);
 
-  // Generate simple tone directly to PIO
-  for (int j = 0; j < 44100; j++) { // 1 second
-    int16_t value = ((j % 100) < 50) ? 16000 : -16000;
+  for (int j = 0; j < 44100; j++) {
+    int16_t value = (int16_t)(12000.0f * sinf(2.0f * 3.14159265f * j / 100));
     uint32_t sample = ((uint32_t)(uint16_t)value << 16) | (uint16_t)value;
     pio_sm_put_blocking(AUDIO_PIO, audio_sm, sample);
   }

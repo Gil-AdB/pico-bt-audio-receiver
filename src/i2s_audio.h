@@ -28,6 +28,10 @@ uint32_t i2s_audio_get_free_samples(void);
 // Start/stop playback
 void i2s_audio_start(void);
 void i2s_audio_stop(void);
+bool i2s_audio_is_active(void);
+
+// Set sample rate (44100 or 48000)
+void i2s_audio_set_sample_rate(uint32_t rate);
 
 // Play test tone (440Hz for 2 seconds)
 void i2s_play_test_tone(void);

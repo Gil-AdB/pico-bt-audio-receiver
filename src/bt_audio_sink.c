@@ -17,6 +17,7 @@ static uint8_t audio_volume = 100;
 // Debug counters
 static uint32_t total_pcm_samples = 0;
 static uint32_t total_media_packets = 0;
+static bool sample_rate_set = false;
 
 // SBC configuration
 static btstack_sbc_decoder_state_t sbc_decoder_state;
@@ -71,8 +72,22 @@ static void a2dp_sink_packet_handler(uint8_t packet_type, uint16_t channel,
       break;
 
     case A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_SBC_CONFIGURATION: {
-      printf("[A2DP] SBC codec configured\n");
-      // Accept any configuration from source
+      // Extract sample rate from SBC configuration
+      uint8_t sampling_freq =
+          a2dp_subevent_signaling_media_codec_sbc_configuration_get_sampling_frequency(
+              packet);
+      uint32_t sample_rate = 44100; // Default
+      if (sampling_freq & 0x20)
+        sample_rate = 44100;
+      else if (sampling_freq & 0x10)
+        sample_rate = 48000;
+      else if (sampling_freq & 0x40)
+        sample_rate = 32000;
+      else if (sampling_freq & 0x80)
+        sample_rate = 16000;
+
+      i2s_audio_set_sample_rate(sample_rate);
+      printf("[A2DP] SBC configured: %u Hz\n", sample_rate);
       break;
     }
 
@@ -109,9 +124,10 @@ static void a2dp_sink_packet_handler(uint8_t packet_type, uint16_t channel,
     case A2DP_SUBEVENT_SIGNALING_CONNECTION_RELEASED:
       printf("[A2DP] Connection released\n");
       a2dp_cid = 0;
-      // Reset counters for clean reconnection
+      // Reset state for clean reconnection
       total_pcm_samples = 0;
       total_media_packets = 0;
+      sample_rate_set = false; // Reset sample rate flag
       i2s_audio_stop();
       break;
 
@@ -131,7 +147,13 @@ static void sbc_decode_callback(int16_t *pcm_data, int num_samples,
                                 int num_channels, int sample_rate,
                                 void *context) {
   (void)context;
-  (void)sample_rate;
+
+  // Set sample rate once on first decoded frame
+  if (!sample_rate_set && sample_rate > 0) {
+    printf("[AUDIO] Detected sample rate: %d Hz\n", sample_rate);
+    i2s_audio_set_sample_rate(sample_rate);
+    sample_rate_set = true;
+  }
 
   // Write decoded PCM to I2S buffer
   uint32_t total_samples = num_samples * num_channels;
