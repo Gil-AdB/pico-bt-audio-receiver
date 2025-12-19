@@ -6,3 +6,7 @@ build/
 *.map
 *.hex
 *.dis
+.idea/
+.DS_Store
+.cache/
+build/

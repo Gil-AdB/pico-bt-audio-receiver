@@ -1,11 +1,32 @@
 // main.c - Pico BT Audio Receiver Entry Point
 #include "bt_audio_sink.h"
 #include "btstack.h"
+#include "btstack_run_loop.h"
 #include "i2s_audio.h"
 #include "pico/btstack_cyw43.h"
 #include "pico/cyw43_arch.h"
 #include "pico/stdlib.h"
 #include <stdio.h>
+
+// LED heartbeat state
+static uint32_t last_led_time = 0;
+static bool led_state = false;
+
+// BTstack timer for LED heartbeat (since btstack_run_loop_execute is blocking)
+static btstack_timer_source_t led_timer;
+
+static void led_heartbeat_handler(btstack_timer_source_t *ts) {
+  (void)ts;
+
+  // Toggle LED
+  led_state = !led_state;
+  cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, led_state);
+
+  // Set next timeout based on connection status
+  uint32_t blink_rate = bt_audio_sink_is_connected() ? 1000 : 250;
+  btstack_run_loop_set_timer(&led_timer, blink_rate);
+  btstack_run_loop_add_timer(&led_timer);
+}
 
 int main() {
   stdio_init_all();
@@ -33,11 +54,6 @@ int main() {
   printf("[MAIN] CYW43 initialized\n");
 
   // Initialize BTstack with TLV storage for persistent pairing
-  // This uses the built-in btstack_cyw43 helper which sets up:
-  // - btstack_memory
-  // - btstack_run_loop (async context)
-  // - TLV flash storage for link keys
-  // - Link key database
   printf("[MAIN] Initializing BTstack with TLV storage...\n");
   if (!btstack_cyw43_init(cyw43_arch_async_context())) {
     printf("[ERROR] Failed to initialize BTstack!\n");
@@ -50,34 +66,23 @@ int main() {
   // Initialize A2DP Sink (after BTstack is initialized)
   bt_audio_sink_init();
 
-  // Play test tone to verify I2S audio output (using DMA)
-  printf("[MAIN] Playing I2S test tone...\\n");
+  // Play test tone to verify I2S audio output
+  printf("[MAIN] Playing I2S test tone...\n");
   i2s_play_test_tone();
+
+  // Setup LED heartbeat timer (runs inside BTstack run loop)
+  btstack_run_loop_set_timer_handler(&led_timer, led_heartbeat_handler);
+  btstack_run_loop_set_timer(&led_timer, 250);
+  btstack_run_loop_add_timer(&led_timer);
 
   // Turn on Bluetooth
   hci_power_control(HCI_POWER_ON);
 
   printf("Bluetooth powered on, waiting for connections...\n");
+  printf("[LED] Fast blink = discoverable, Slow blink = connected\n");
 
-  // LED heartbeat
-  uint32_t last_led_time = 0;
-  bool led_state = false;
-
-  // Main loop
-  while (1) {
-    // Process BTstack
-    btstack_run_loop_execute();
-
-    // LED heartbeat (blink pattern indicates status)
-    uint32_t now = to_ms_since_boot(get_absolute_time());
-    uint32_t blink_rate = bt_audio_sink_is_connected() ? 1000 : 250;
-
-    if (now - last_led_time >= blink_rate) {
-      led_state = !led_state;
-      cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, led_state);
-      last_led_time = now;
-    }
-  }
+  // Run BTstack event loop (this blocks forever)
+  btstack_run_loop_execute();
 
   return 0;
 }
