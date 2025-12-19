@@ -19,9 +19,12 @@ target_sources(${PROJECT_NAME} PRIVATE
     src/i2s_audio.c
 )
 
+pico_generate_pio_header(${PROJECT_NAME} ${CMAKE_CURRENT_SOURCE_DIR}/src/audio_i2s.pio)
+
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_BINARY_DIR}
 )
 
 target_link_libraries(${PROJECT_NAME}
@@ -32,6 +35,7 @@ target_link_libraries(${PROJECT_NAME}
     pico_btstack_sbc_decoder
     hardware_pio
     hardware_dma
+    hardware_pwm
 )
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE

@@ -29,4 +29,10 @@ uint32_t i2s_audio_get_free_samples(void);
 void i2s_audio_start(void);
 void i2s_audio_stop(void);
 
+// Play test tone (440Hz for 2 seconds)
+void i2s_play_test_tone(void);
+
+// Direct PIO test (no DMA) - for debugging GPIO/PIO issues
+void i2s_direct_test(void);
+
 #endif // I2S_AUDIO_H
