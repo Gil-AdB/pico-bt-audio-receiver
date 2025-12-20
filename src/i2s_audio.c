@@ -224,9 +224,12 @@ void i2s_audio_start(void) {
     memset(dma_buffer_a, 0, sizeof(dma_buffer_a));
     memset(dma_buffer_b, 0, sizeof(dma_buffer_b));
 
-    // Reset DMA read addresses
+    // Fully reconfigure DMA channels after abort
+    // (abort doesn't reset transfer count, causing issues on restart)
     dma_channel_set_read_addr(dma_chan_a, dma_buffer_a, false);
+    dma_channel_set_trans_count(dma_chan_a, DMA_BUFFER_SAMPLES, false);
     dma_channel_set_read_addr(dma_chan_b, dma_buffer_b, false);
+    dma_channel_set_trans_count(dma_chan_b, DMA_BUFFER_SAMPLES, false);
 
     // Enable PIO
     pio_sm_set_enabled(AUDIO_PIO, audio_sm, true);

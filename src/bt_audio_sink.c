@@ -103,6 +103,7 @@ static void a2dp_sink_packet_handler(uint8_t packet_type, uint16_t channel,
 
     case A2DP_SUBEVENT_STREAM_STARTED:
       printf("[A2DP] Stream started\n");
+      sample_rate_set = false; // Reset to detect rate on this stream
       i2s_audio_start();
       break;
 
