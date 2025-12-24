@@ -18,9 +18,9 @@
 // ============================================================================
 #define AUDIO_PIO pio0
 
-// Ring Buffer - absorbs Bluetooth jitter (~180ms at 44.1kHz stereo)
-#define RING_BUFFER_SIZE (16 * 1024) // 16KB = 4096 stereo samples
-static uint32_t ring_buffer[RING_BUFFER_SIZE / sizeof(uint32_t)];
+// Ring Buffer - absorbs Bluetooth jitter (~93ms at 44.1kHz stereo)
+#define RING_BUFFER_SAMPLES 4096 // 4096 stereo samples = 16KB
+static uint32_t ring_buffer[RING_BUFFER_SAMPLES];
 static volatile uint32_t ring_head = 0; // Write position
 static volatile uint32_t ring_tail = 0; // Read position
 
@@ -37,13 +37,15 @@ static int dma_chan_b;
 static uint audio_sm;
 static uint audio_offset;
 static volatile bool active = false;
+static volatile uint32_t silence_count =
+    0; // Count of silence buffers filled after stop
 static uint32_t sample_freq = 44100;
 static volatile uint32_t dma_irq_count = 0;
 
 // ============================================================================
 // Ring Buffer Operations (lock-free single producer, single consumer)
 // ============================================================================
-#define RING_MASK ((RING_BUFFER_SIZE / sizeof(uint32_t)) - 1)
+#define RING_MASK (RING_BUFFER_SAMPLES - 1)
 
 static inline uint32_t ring_available(void) {
   return (ring_head - ring_tail) & RING_MASK;
@@ -52,17 +54,25 @@ static inline uint32_t ring_available(void) {
 static inline uint32_t ring_free(void) { return RING_MASK - ring_available(); }
 
 static void ring_write(const uint32_t *data, uint32_t count) {
-  for (uint32_t i = 0; i < count; i++) {
-    ring_buffer[ring_head] = data[i];
-    ring_head = (ring_head + 1) & RING_MASK;
+  uint32_t first = (RING_MASK + 1) - ring_head; // space before wrap
+  if (first >= count) {
+    memcpy(&ring_buffer[ring_head], data, count * sizeof(uint32_t));
+  } else {
+    memcpy(&ring_buffer[ring_head], data, first * sizeof(uint32_t));
+    memcpy(ring_buffer, data + first, (count - first) * sizeof(uint32_t));
   }
+  ring_head = (ring_head + count) & RING_MASK;
 }
 
 static void ring_read(uint32_t *dest, uint32_t count) {
-  for (uint32_t i = 0; i < count; i++) {
-    dest[i] = ring_buffer[ring_tail];
-    ring_tail = (ring_tail + 1) & RING_MASK;
+  uint32_t first = (RING_MASK + 1) - ring_tail; // space before wrap
+  if (first >= count) {
+    memcpy(dest, &ring_buffer[ring_tail], count * sizeof(uint32_t));
+  } else {
+    memcpy(dest, &ring_buffer[ring_tail], first * sizeof(uint32_t));
+    memcpy(dest + first, ring_buffer, (count - first) * sizeof(uint32_t));
   }
+  ring_tail = (ring_tail + count) & RING_MASK;
 }
 
 static void ring_clear(void) {
@@ -95,6 +105,7 @@ static void __isr __time_critical_func(dma_irq_handler)(void) {
     // When not active, always fill with silence (prevents noise after tones)
     if (!active) {
       memset(buffer_to_fill, 0, DMA_BUFFER_SAMPLES * sizeof(uint32_t));
+      silence_count++; // Track silence buffers for clean start
     } else {
       uint32_t available = ring_available();
       if (available >= DMA_BUFFER_SAMPLES) {
@@ -261,9 +272,17 @@ void i2s_audio_start(void) {
   if (!active) {
     printf("[I2S] Starting...\n");
 
+    // Wait until at least 2 silence buffers have been filled
+    // This ensures both DMA buffers contain silence (no stale audio)
+    while (silence_count < 2) {
+      tight_loop_contents();
+    }
+
     // Disable DMA IRQ while setting up
     irq_set_enabled(DMA_IRQ_0, false);
     ring_clear();
+    // Don't memset buffers - they're already silence from the wait above
+    // memset would race with DMA reading the buffer
     active = true;
     irq_set_enabled(DMA_IRQ_0, true);
 
@@ -279,6 +298,7 @@ void i2s_audio_stop(void) {
     // Disable DMA IRQ while clearing
     irq_set_enabled(DMA_IRQ_0, false);
     active = false;
+    silence_count = 0; // Reset counter, IRQ will start filling silence
     ring_clear();
     // DMA continues running, IRQ handler will fill with silence
     irq_set_enabled(DMA_IRQ_0, true);
