@@ -278,11 +278,26 @@ void i2s_audio_start(void) {
       tight_loop_contents();
     }
 
+    // Debug: show DMA state before starting
+    printf("[I2S_DBG] silence_count=%u, buf_a=%p, buf_b=%p\n", silence_count,
+           (void *)dma_buffer_a, (void *)dma_buffer_b);
+    printf("[I2S_DBG] dma_a_read=%p, dma_b_read=%p\n",
+           (void *)dma_channel_hw_addr(dma_chan_a)->read_addr,
+           (void *)dma_channel_hw_addr(dma_chan_b)->read_addr);
+    printf("[I2S_DBG] dma_a_busy=%d, dma_b_busy=%d\n",
+           dma_channel_is_busy(dma_chan_a), dma_channel_is_busy(dma_chan_b));
+
     // Disable DMA IRQ while setting up
     irq_set_enabled(DMA_IRQ_0, false);
     ring_clear();
+
     // Don't memset buffers - they're already silence from the wait above
     // memset would race with DMA reading the buffer
+
+    // Explicitly reset DMA read addresses to start of buffers
+    dma_channel_set_read_addr(dma_chan_a, dma_buffer_a, false);
+    dma_channel_set_read_addr(dma_chan_b, dma_buffer_b, false);
+
     active = true;
     irq_set_enabled(DMA_IRQ_0, true);
 
@@ -294,6 +309,10 @@ void i2s_audio_start(void) {
 void i2s_audio_stop(void) {
   if (active) {
     printf("[I2S] Stopping...\n");
+
+    // Debug: show DMA state before stopping
+    printf("[I2S_DBG] dma_a_busy=%d, dma_b_busy=%d\n",
+           dma_channel_is_busy(dma_chan_a), dma_channel_is_busy(dma_chan_b));
 
     // Disable DMA IRQ while clearing
     irq_set_enabled(DMA_IRQ_0, false);

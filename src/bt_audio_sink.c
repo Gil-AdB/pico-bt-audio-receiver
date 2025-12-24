@@ -6,6 +6,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "btstack_tlv.h"
+
 // A2DP sink state
 static uint8_t a2dp_local_seid = 0;
 static uint16_t a2dp_cid = 0;
@@ -15,6 +17,38 @@ static uint8_t media_initialized = 0;
 // Auto-reconnect: last connected device
 static bd_addr_t last_connected_addr;
 static bool has_last_device = false;
+static btstack_timer_source_t reconnect_timer;
+
+#define TLV_TAG_LAST_ADDR 0x41444452 // 'ADDR'
+
+static void load_last_device(void) {
+  const btstack_tlv_t *tlv_impl;
+  void *tlv_context;
+  btstack_tlv_get_instance(&tlv_impl, &tlv_context);
+  if (!tlv_impl)
+    return;
+
+  uint8_t buffer[6];
+  int len = tlv_impl->get_tag(tlv_context, TLV_TAG_LAST_ADDR, buffer, 6);
+  if (len == 6) {
+    memcpy(last_connected_addr, buffer, 6);
+    has_last_device = true;
+    printf("[A2DP] Loaded last device: %s\n",
+           bd_addr_to_str(last_connected_addr));
+  }
+}
+
+static void save_last_device(bd_addr_t addr) {
+  const btstack_tlv_t *tlv_impl;
+  void *tlv_context;
+  btstack_tlv_get_instance(&tlv_impl, &tlv_context);
+  if (!tlv_impl)
+    return;
+
+  tlv_impl->store_tag(tlv_context, TLV_TAG_LAST_ADDR, addr, 6);
+  printf("[A2DP] Saved last device: %s\n", bd_addr_to_str(addr));
+}
+
 static btstack_timer_source_t reconnect_timer;
 
 // Volume control (0-127, default 100 = ~79%)
@@ -86,6 +120,9 @@ static void status_timer_handler(btstack_timer_source_t *ts) {
 static void packet_handler(uint8_t packet_type, uint16_t channel,
                            uint8_t *packet, uint16_t size);
 
+// Auto-reconnect timer handler forward declaration
+static void reconnect_timer_handler(btstack_timer_source_t *ts);
+
 // Service record for A2DP Sink
 static uint8_t a2dp_sink_service_buffer[160];
 static uint8_t avrcp_target_service_buffer[200];
@@ -116,22 +153,7 @@ static void a2dp_sink_packet_handler(uint8_t packet_type, uint16_t channel,
   uint8_t status;
 
   switch (event) {
-  case BTSTACK_EVENT_STATE:
-    if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING) {
-      printf("[BT] HCI working - setting discoverable and connectable\n");
-      gap_discoverable_control(1);
-      gap_connectable_control(1);
-
-      // Print the local Bluetooth address
-      bd_addr_t local_addr;
-      gap_local_bd_addr(local_addr);
-      printf("[BT] Local address: %s\n", bd_addr_to_str(local_addr));
-
-      // Start BOOTSEL timer now that HCI is working (avoids QSPI conflict)
-      extern void start_bootsel_timer(void);
-      start_bootsel_timer();
-    }
-    break;
+    // BTSTACK_EVENT_STATE now handled in main_packet_handler (main.c)
 
   case HCI_EVENT_A2DP_META:
     switch (hci_event_a2dp_meta_get_subevent_code(packet)) {
@@ -149,6 +171,7 @@ static void a2dp_sink_packet_handler(uint8_t packet_type, uint16_t channel,
       a2dp_subevent_signaling_connection_established_get_bd_addr(
           packet, last_connected_addr);
       has_last_device = true;
+      save_last_device(last_connected_addr);
 
       printf("[A2DP] Connected to %s, cid 0x%04x\n",
              bd_addr_to_str(last_connected_addr), a2dp_cid);
@@ -370,6 +393,9 @@ void bt_audio_sink_init(void) {
   a2dp_sink_init();
   a2dp_sink_register_packet_handler(&a2dp_sink_packet_handler);
   a2dp_sink_register_media_handler(&media_packet_handler);
+
+  // Load last connected device from TLV
+  load_last_device();
 
   // Create A2DP service record
   a2dp_sink_create_sdp_record(a2dp_sink_service_buffer, 0x10001, AVDTP_SINK,

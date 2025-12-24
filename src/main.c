@@ -57,7 +57,7 @@ void hard_fault_handler_c(uint32_t *stack) {
 // From pico-examples/button/button.c
 // ============================================================================
 
-static bool get_bootsel_button(void) {
+static bool __not_in_flash_func(get_bootsel_button)(void) {
   const uint CS_PIN_INDEX = 1;
 
   // Temporarily disable interrupts
@@ -244,6 +244,35 @@ static void exit_pairing_mode(void) {
 }
 
 // ============================================================================
+// Main HCI packet handler to catch state changes
+// ============================================================================
+static void main_packet_handler(uint8_t packet_type, uint16_t channel,
+                                uint8_t *packet, uint16_t size) {
+  (void)channel;
+  (void)size;
+
+  if (packet_type != HCI_EVENT_PACKET)
+    return;
+
+  switch (hci_event_packet_get_type(packet)) {
+  case BTSTACK_EVENT_STATE:
+    if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING) {
+      printf("[MAIN] HCI working - starting timers\n");
+
+      // DISABLED: User reported crackling/stuck (QSPI conflict)
+      // start_bootsel_timer();
+
+      // Schedule auto-reconnect
+      extern void bt_audio_sink_reconnect_last(void);
+      bt_audio_sink_reconnect_last();
+    }
+    break;
+  }
+}
+
+static btstack_packet_callback_registration_t hci_event_callback_registration;
+
+// ============================================================================
 // Main
 // ============================================================================
 int main() {
@@ -276,6 +305,10 @@ int main() {
     }
   }
   printf("[MAIN] BTstack initialized with link key persistence\n");
+
+  // Register for HCI events
+  hci_event_callback_registration.callback = &main_packet_handler;
+  hci_add_event_handler(&hci_event_callback_registration);
 
   // Initialize A2DP Sink
   bt_audio_sink_init();
