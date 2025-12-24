@@ -265,12 +265,6 @@ void i2s_audio_start(void) {
     irq_set_enabled(DMA_IRQ_0, false);
     ring_clear();
     active = true;
-
-    // Reset DMA read addresses and start channel A (will chain to B)
-    dma_channel_set_read_addr(dma_chan_a, dma_buffer_a, false);
-    dma_channel_set_read_addr(dma_chan_b, dma_buffer_b, false);
-    dma_channel_start(dma_chan_a);
-
     irq_set_enabled(DMA_IRQ_0, true);
 
     printf("[I2S] Started, dma_count=%u, ring=%u\n", dma_irq_count,
@@ -282,18 +276,11 @@ void i2s_audio_stop(void) {
   if (active) {
     printf("[I2S] Stopping...\n");
 
-    // Disable DMA IRQ and abort DMA channels
+    // Disable DMA IRQ while clearing
     irq_set_enabled(DMA_IRQ_0, false);
-    dma_channel_abort(dma_chan_a);
-    dma_channel_abort(dma_chan_b);
-
     active = false;
     ring_clear();
-
-    // Clear DMA buffers (safe now since DMA is stopped)
-    memset(dma_buffer_a, 0, sizeof(dma_buffer_a));
-    memset(dma_buffer_b, 0, sizeof(dma_buffer_b));
-
+    // DMA continues running, IRQ handler will fill with silence
     irq_set_enabled(DMA_IRQ_0, true);
 
     printf("[I2S] Stopped, dma_count=%u\n", dma_irq_count);

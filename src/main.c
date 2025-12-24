@@ -249,14 +249,10 @@ static void exit_pairing_mode(void) {
 int main() {
   stdio_init_all();
 
-  // Wait for USB serial to connect
-  printf("\n\nWaiting 3 seconds for serial...\n");
-  for (int i = 3; i > 0; i--) {
-    printf("%d...\n", i);
-    sleep_ms(1000);
-  }
-
   printf("\n");
+  printf("========================================\n");
+  printf("   Pico BT Audio Receiver\n");
+  printf("========================================\n");
   printf("========================================\n");
   printf("   Pico BT Audio Receiver\n");
   printf("========================================\n");
