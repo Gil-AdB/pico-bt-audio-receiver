@@ -116,6 +116,23 @@ static void a2dp_sink_packet_handler(uint8_t packet_type, uint16_t channel,
   uint8_t status;
 
   switch (event) {
+  case BTSTACK_EVENT_STATE:
+    if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING) {
+      printf("[BT] HCI working - setting discoverable and connectable\n");
+      gap_discoverable_control(1);
+      gap_connectable_control(1);
+
+      // Print the local Bluetooth address
+      bd_addr_t local_addr;
+      gap_local_bd_addr(local_addr);
+      printf("[BT] Local address: %s\n", bd_addr_to_str(local_addr));
+
+      // Start BOOTSEL timer now that HCI is working (avoids QSPI conflict)
+      extern void start_bootsel_timer(void);
+      start_bootsel_timer();
+    }
+    break;
+
   case HCI_EVENT_A2DP_META:
     switch (hci_event_a2dp_meta_get_subevent_code(packet)) {
     case A2DP_SUBEVENT_SIGNALING_CONNECTION_ESTABLISHED:
@@ -172,6 +189,11 @@ static void a2dp_sink_packet_handler(uint8_t packet_type, uint16_t channel,
       printf("[A2DP] Stream started\n");
       sample_rate_set = false; // Reset to detect rate on this stream
       decoder_stall_count = 0; // Reset watchdog counter
+
+      // Reset SBC decoder to clear any stale state from previous stream
+      btstack_sbc_decoder_init(&sbc_decoder_state, SBC_MODE_STANDARD,
+                               sbc_decode_callback, NULL);
+
       i2s_audio_start();
       // Start status timer
       status_timer_active = true;
@@ -182,6 +204,9 @@ static void a2dp_sink_packet_handler(uint8_t packet_type, uint16_t channel,
 
     case A2DP_SUBEVENT_STREAM_SUSPENDED:
       printf("[A2DP] Stream suspended\n");
+      // Stop status timer during suspend
+      status_timer_active = false;
+      btstack_run_loop_remove_timer(&status_timer);
       i2s_audio_stop();
       break;
 

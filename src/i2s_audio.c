@@ -92,17 +92,22 @@ static void __isr __time_critical_func(dma_irq_handler)(void) {
   }
 
   if (buffer_to_fill) {
-    uint32_t available = ring_available();
-    if (available >= DMA_BUFFER_SAMPLES) {
-      ring_read(buffer_to_fill, DMA_BUFFER_SAMPLES);
-    } else if (available > 0) {
-      // Partial fill + silence
-      ring_read(buffer_to_fill, available);
-      memset(&buffer_to_fill[available], 0,
-             (DMA_BUFFER_SAMPLES - available) * sizeof(uint32_t));
-    } else {
-      // Underrun - fill with silence
+    // When not active, always fill with silence (prevents noise after tones)
+    if (!active) {
       memset(buffer_to_fill, 0, DMA_BUFFER_SAMPLES * sizeof(uint32_t));
+    } else {
+      uint32_t available = ring_available();
+      if (available >= DMA_BUFFER_SAMPLES) {
+        ring_read(buffer_to_fill, DMA_BUFFER_SAMPLES);
+      } else if (available > 0) {
+        // Partial fill + silence
+        ring_read(buffer_to_fill, available);
+        memset(&buffer_to_fill[available], 0,
+               (DMA_BUFFER_SAMPLES - available) * sizeof(uint32_t));
+      } else {
+        // Underrun - fill with silence
+        memset(buffer_to_fill, 0, DMA_BUFFER_SAMPLES * sizeof(uint32_t));
+      }
     }
   }
 }
@@ -122,10 +127,8 @@ static void update_pio_frequency(uint32_t freq) {
                              divider & 0xffu);
   sample_freq = freq;
 
-  // Re-enable PIO and IRQ
-  if (active) {
-    pio_sm_set_enabled(AUDIO_PIO, audio_sm, true);
-  }
+  // Always re-enable PIO since DMA runs continuously
+  pio_sm_set_enabled(AUDIO_PIO, audio_sm, true);
   irq_set_enabled(DMA_IRQ_0, true);
 
   printf("[I2S] Sample rate set to %u Hz\n", freq);
@@ -206,16 +209,31 @@ void i2s_audio_init(void) {
 // ============================================================================
 // Audio Write - Push to ring buffer (never blocks)
 // ============================================================================
+static uint32_t write_count = 0;
+
 uint32_t i2s_audio_write(const int16_t *samples, uint32_t num_samples) {
+  write_count++;
+
+  // Debug: print every 100 writes
+  if (write_count % 100 == 0 || write_count < 5) {
+    printf("[I2S_WR] #%u samples=%u active=%d ring_free=%u\n", write_count,
+           num_samples, active, ring_free());
+  }
+
   if (!active)
     return 0;
+
+  // Disable DMA IRQ to prevent race with ring_head/ring_tail access
+  irq_set_enabled(DMA_IRQ_0, false);
 
   uint32_t pairs = num_samples / 2;
   uint32_t free = ring_free();
   if (pairs > free)
     pairs = free;
-  if (pairs == 0)
+  if (pairs == 0) {
+    irq_set_enabled(DMA_IRQ_0, true);
     return 0;
+  }
 
   // Pack and write to ring buffer
   for (uint32_t i = 0; i < pairs; i++) {
@@ -226,6 +244,7 @@ uint32_t i2s_audio_write(const int16_t *samples, uint32_t num_samples) {
     ring_head = (ring_head + 1) & RING_MASK;
   }
 
+  irq_set_enabled(DMA_IRQ_0, true);
   return pairs * 2;
 }
 
@@ -242,10 +261,16 @@ void i2s_audio_start(void) {
   if (!active) {
     printf("[I2S] Starting...\n");
 
-    // Disable DMA IRQ while clearing ring buffer to prevent race
+    // Disable DMA IRQ while setting up
     irq_set_enabled(DMA_IRQ_0, false);
     ring_clear();
     active = true;
+
+    // Reset DMA read addresses and start channel A (will chain to B)
+    dma_channel_set_read_addr(dma_chan_a, dma_buffer_a, false);
+    dma_channel_set_read_addr(dma_chan_b, dma_buffer_b, false);
+    dma_channel_start(dma_chan_a);
+
     irq_set_enabled(DMA_IRQ_0, true);
 
     printf("[I2S] Started, dma_count=%u, ring=%u\n", dma_irq_count,
@@ -257,10 +282,18 @@ void i2s_audio_stop(void) {
   if (active) {
     printf("[I2S] Stopping...\n");
 
-    // Disable DMA IRQ while clearing ring buffer to prevent race
+    // Disable DMA IRQ and abort DMA channels
     irq_set_enabled(DMA_IRQ_0, false);
+    dma_channel_abort(dma_chan_a);
+    dma_channel_abort(dma_chan_b);
+
     active = false;
     ring_clear();
+
+    // Clear DMA buffers (safe now since DMA is stopped)
+    memset(dma_buffer_a, 0, sizeof(dma_buffer_a));
+    memset(dma_buffer_b, 0, sizeof(dma_buffer_b));
+
     irq_set_enabled(DMA_IRQ_0, true);
 
     printf("[I2S] Stopped, dma_count=%u\n", dma_irq_count);

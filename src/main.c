@@ -2,6 +2,9 @@
 #include "bt_audio_sink.h"
 #include "btstack.h"
 #include "btstack_run_loop.h"
+#include "hardware/structs/ioqspi.h"
+#include "hardware/structs/sio.h"
+#include "hardware/sync.h"
 #include "i2s_audio.h"
 #include "pico/btstack_cyw43.h"
 #include "pico/cyw43_arch.h"
@@ -49,8 +52,38 @@ void hard_fault_handler_c(uint32_t *stack) {
   }
 }
 
-// BOOTSEL button is directly readable via QSPI CS pin
-#define BOOTSEL_PIN_READ() (!gpio_get(PICO_DEFAULT_BOOTSEL_GPIO_PIN))
+// ============================================================================
+// BOOTSEL Button Reading - uses QSPI registers (not a normal GPIO)
+// From pico-examples/button/button.c
+// ============================================================================
+
+static bool get_bootsel_button(void) {
+  const uint CS_PIN_INDEX = 1;
+
+  // Temporarily disable interrupts
+  uint32_t flags = save_and_disable_interrupts();
+
+  // Set the CS pin to input (override output enable to low)
+  hw_write_masked(&ioqspi_hw->io[CS_PIN_INDEX].ctrl,
+                  GPIO_OVERRIDE_LOW << IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_LSB,
+                  IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS);
+
+  // Small delay for pin to settle
+  for (volatile int i = 0; i < 32; i++)
+    ;
+
+  // Read the button state (inverted - button pressed = low = true)
+  bool button_state = !(sio_hw->gpio_hi_in & (1u << CS_PIN_INDEX));
+
+  // Restore the CS pin to normal operation
+  hw_write_masked(&ioqspi_hw->io[CS_PIN_INDEX].ctrl,
+                  GPIO_OVERRIDE_NORMAL << IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_LSB,
+                  IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS);
+
+  restore_interrupts(flags);
+
+  return button_state;
+}
 
 // Pairing mode state
 static bool pairing_mode = false;
@@ -97,18 +130,46 @@ static void led_heartbeat_handler(btstack_timer_source_t *ts) {
 // ============================================================================
 // BOOTSEL button checker - runs every 100ms
 // ============================================================================
+static uint32_t bootsel_check_count = 0;
+
 static void check_bootsel_button(btstack_timer_source_t *ts) {
   (void)ts;
 
-  // On Pico W, we can't directly read BOOTSEL, so we use an alternative
-  // approach The BOOTSEL button grounds the flash CS pin when pressed For
-  // simplicity, we'll check if the user manually triggers pairing via USB
-  // command OR we use the built-in method
+  bool pressed = get_bootsel_button();
+  bootsel_check_count++;
 
-  // Alternative: Use GPIO 9 if user has connected a button there
-  // For now, we'll just reschedule the timer
-  // TODO: Implement proper BOOTSEL detection or use external button
+  // Debug: print status every 5 seconds
+  if (bootsel_check_count % 50 == 0) {
+    printf("[BOOTSEL] Check #%u, pressed=%d\n", bootsel_check_count, pressed);
+  }
 
+  if (pressed) {
+    if (!bootsel_was_pressed) {
+      // Button just pressed
+      bootsel_was_pressed = true;
+      bootsel_press_start = to_ms_since_boot(get_absolute_time());
+      printf("[BOOTSEL] Button pressed!\n");
+    } else {
+      // Button still held - check for 3 second hold
+      uint32_t held_time =
+          to_ms_since_boot(get_absolute_time()) - bootsel_press_start;
+      if (held_time >= 3000 && !pairing_mode) {
+        printf("[BOOTSEL] Held for 3 seconds - entering pairing mode\n");
+        enter_pairing_mode();
+      }
+    }
+  } else {
+    bootsel_was_pressed = false;
+  }
+
+  btstack_run_loop_set_timer(&bootsel_timer, 100);
+  btstack_run_loop_add_timer(&bootsel_timer);
+}
+
+// Start the BOOTSEL timer - called after HCI is working to avoid QSPI conflicts
+void start_bootsel_timer(void) {
+  printf("[BOOTSEL] Starting timer now that HCI is working\n");
+  btstack_run_loop_set_timer_handler(&bootsel_timer, check_bootsel_button);
   btstack_run_loop_set_timer(&bootsel_timer, 100);
   btstack_run_loop_add_timer(&bootsel_timer);
 }
@@ -226,27 +287,40 @@ int main() {
   // Play startup tone
   printf("[MAIN] Playing startup tone...\n");
   i2s_play_test_tone();
+  printf("[MAIN] Startup tone done\n");
 
   // Setup LED heartbeat timer
+  printf("[MAIN] Setting up LED timer\n");
   btstack_run_loop_set_timer_handler(&led_timer, led_heartbeat_handler);
   btstack_run_loop_set_timer(&led_timer, 250);
   btstack_run_loop_add_timer(&led_timer);
 
+  // BOOTSEL timer disabled for testing - may conflict with CYW43
+  // printf("[MAIN] Setting up BOOTSEL timer\n");
+  // btstack_run_loop_set_timer_handler(&bootsel_timer, check_bootsel_button);
+  // btstack_run_loop_set_timer(&bootsel_timer, 100);
+  // btstack_run_loop_add_timer(&bootsel_timer);
+
   // Turn on Bluetooth
+  printf("[MAIN] Calling hci_power_control(HCI_POWER_ON)\n");
   hci_power_control(HCI_POWER_ON);
 
   // Keep device discoverable and connectable for auto-reconnect
   // macOS needs the device to be visible for auto-reconnect to work
+  printf("[MAIN] Setting discoverable and connectable\n");
   gap_discoverable_control(1);
   gap_connectable_control(1);
 
-  // Schedule auto-reconnect to last connected device
-  bt_audio_sink_schedule_reconnect();
+  // Auto-reconnect disabled for now - needs to be triggered after HCI is
+  // fully ready bt_audio_sink_schedule_reconnect();
 
   printf("Bluetooth powered on - discoverable and connectable\n");
   printf("[LED] Fast blink=pairing, Medium=waiting, Slow=connected\n");
+  stdio_flush();
 
   // Run BTstack event loop (this blocks forever)
+  printf("[MAIN] Entering btstack_run_loop_execute()\n");
+  stdio_flush();
   btstack_run_loop_execute();
 
   return 0;
