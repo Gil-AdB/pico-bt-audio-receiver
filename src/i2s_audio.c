@@ -10,6 +10,7 @@
 #include "hardware/sync.h"
 #include "pico/stdlib.h"
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 
 // ============================================================================
@@ -37,6 +38,7 @@ static uint audio_sm;
 static uint audio_offset;
 static volatile bool active = false;
 static uint32_t sample_freq = 44100;
+static volatile uint32_t dma_irq_count = 0;
 
 // ============================================================================
 // Ring Buffer Operations (lock-free single producer, single consumer)
@@ -76,6 +78,7 @@ static void __isr __time_critical_func(dma_irq_handler)(void) {
 
   if (dma_irqn_get_channel_status(0, dma_chan_a)) {
     dma_irqn_acknowledge_channel(0, dma_chan_a);
+    dma_irq_count++;
     buffer_to_fill = dma_buffer_a;
     // Reset read address for next time this channel plays
     dma_channel_set_read_addr(dma_chan_a, dma_buffer_a, false);
@@ -83,6 +86,7 @@ static void __isr __time_critical_func(dma_irq_handler)(void) {
 
   if (dma_irqn_get_channel_status(0, dma_chan_b)) {
     dma_irqn_acknowledge_channel(0, dma_chan_b);
+    dma_irq_count++;
     buffer_to_fill = dma_buffer_b;
     dma_channel_set_read_addr(dma_chan_b, dma_buffer_b, false);
   }
@@ -109,13 +113,26 @@ static void __isr __time_critical_func(dma_irq_handler)(void) {
 static void update_pio_frequency(uint32_t freq) {
   uint32_t system_clock_frequency = clock_get_hz(clk_sys);
   uint32_t divider = system_clock_frequency * 4 / freq;
+
+  // Disable IRQ and pause PIO while changing clock to prevent crashes
+  irq_set_enabled(DMA_IRQ_0, false);
+  pio_sm_set_enabled(AUDIO_PIO, audio_sm, false);
+
   pio_sm_set_clkdiv_int_frac(AUDIO_PIO, audio_sm, divider >> 8u,
                              divider & 0xffu);
   sample_freq = freq;
+
+  // Re-enable PIO and IRQ
+  if (active) {
+    pio_sm_set_enabled(AUDIO_PIO, audio_sm, true);
+  }
+  irq_set_enabled(DMA_IRQ_0, true);
+
+  printf("[I2S] Sample rate set to %u Hz\n", freq);
 }
 
 void i2s_audio_set_sample_rate(uint32_t rate) {
-  if (rate == 44100 || rate == 48000) {
+  if ((rate == 44100 || rate == 48000) && rate != sample_freq) {
     update_pio_frequency(rate);
   }
 }
@@ -178,6 +195,12 @@ void i2s_audio_init(void) {
   dma_irqn_set_channel_enabled(0, dma_chan_a, true);
   dma_irqn_set_channel_enabled(0, dma_chan_b, true);
   irq_set_enabled(DMA_IRQ_0, true);
+
+  // Start PIO and DMA - they run continuously, playing silence when no data
+  pio_sm_set_enabled(AUDIO_PIO, audio_sm, true);
+  dma_channel_start(dma_chan_a);
+
+  printf("[I2S] Initialized and running\n");
 }
 
 // ============================================================================
@@ -217,72 +240,151 @@ uint32_t i2s_audio_get_free_samples(void) {
 // ============================================================================
 void i2s_audio_start(void) {
   if (!active) {
-    active = true;
+    printf("[I2S] Starting...\n");
 
-    // Clear everything
+    // Disable DMA IRQ while clearing ring buffer to prevent race
+    irq_set_enabled(DMA_IRQ_0, false);
     ring_clear();
-    memset(dma_buffer_a, 0, sizeof(dma_buffer_a));
-    memset(dma_buffer_b, 0, sizeof(dma_buffer_b));
+    active = true;
+    irq_set_enabled(DMA_IRQ_0, true);
 
-    // Fully reconfigure DMA channels after abort
-    // (abort doesn't reset transfer count, causing issues on restart)
-    dma_channel_set_read_addr(dma_chan_a, dma_buffer_a, false);
-    dma_channel_set_trans_count(dma_chan_a, DMA_BUFFER_SAMPLES, false);
-    dma_channel_set_read_addr(dma_chan_b, dma_buffer_b, false);
-    dma_channel_set_trans_count(dma_chan_b, DMA_BUFFER_SAMPLES, false);
-
-    // Enable PIO
-    pio_sm_set_enabled(AUDIO_PIO, audio_sm, true);
-
-    // Start DMA chain
-    dma_channel_start(dma_chan_a);
+    printf("[I2S] Started, dma_count=%u, ring=%u\n", dma_irq_count,
+           ring_available());
   }
 }
 
 void i2s_audio_stop(void) {
   if (active) {
+    printf("[I2S] Stopping...\n");
+
+    // Disable DMA IRQ while clearing ring buffer to prevent race
+    irq_set_enabled(DMA_IRQ_0, false);
     active = false;
-    dma_channel_abort(dma_chan_a);
-    dma_channel_abort(dma_chan_b);
-    pio_sm_set_enabled(AUDIO_PIO, audio_sm, false);
+    ring_clear();
+    irq_set_enabled(DMA_IRQ_0, true);
+
+    printf("[I2S] Stopped, dma_count=%u\n", dma_irq_count);
   }
 }
 
 bool i2s_audio_is_active(void) { return active; }
 
+void i2s_audio_get_stats(uint32_t *irq_count, uint32_t *ring_level) {
+  if (irq_count)
+    *irq_count = dma_irq_count;
+  if (ring_level)
+    *ring_level = ring_available();
+}
+
 // ============================================================================
-// Test Tone - Pleasant Sine Wave
+// Helper: Generate and play a tone segment
 // ============================================================================
-void i2s_play_test_tone(void) {
-#define SINE_TABLE_SIZE 100
-  static int16_t sine_table[SINE_TABLE_SIZE];
-  static bool table_generated = false;
-
-  if (!table_generated) {
-    for (int i = 0; i < SINE_TABLE_SIZE; i++) {
-      sine_table[i] =
-          (int16_t)(12000.0f * sinf(2.0f * 3.14159265f * i / SINE_TABLE_SIZE));
-    }
-    table_generated = true;
-  }
-
-  i2s_audio_start();
-
-  // Fill ring buffer with sine wave, let it play for 1 second
+static void play_tone_segment(float freq1, float freq2, int duration_ms,
+                              int amplitude, bool fade_out) {
+  const float sample_rate = 44100.0f;
+  const int total_samples = (int)(sample_rate * duration_ms / 1000);
   int16_t stereo_samples[200];
-  for (int chunk = 0; chunk < 441; chunk++) { // ~1 second at 44.1kHz
-    for (int i = 0; i < 100; i++) {
-      stereo_samples[i * 2] = sine_table[i];
-      stereo_samples[i * 2 + 1] = sine_table[i];
+  int sample_idx = 0;
+
+  while (sample_idx < total_samples) {
+    int chunk_size = 100;
+    if (sample_idx + chunk_size > total_samples) {
+      chunk_size = total_samples - sample_idx;
     }
-    while (i2s_audio_get_free_samples() < 200) {
+
+    for (int i = 0; i < chunk_size; i++) {
+      int s = sample_idx + i;
+      float envelope = 1.0f;
+      if (fade_out) {
+        envelope = 1.0f - ((float)s / total_samples);
+        envelope = envelope * envelope;
+      }
+
+      float t = (float)s / sample_rate;
+      float wave1 = sinf(2.0f * 3.14159265f * freq1 * t);
+      float wave2 = (freq2 > 0) ? sinf(2.0f * 3.14159265f * freq2 * t) : 0;
+      float combined = (freq2 > 0) ? (wave1 + wave2 * 0.7f) / 1.7f : wave1;
+
+      int16_t value = (int16_t)(amplitude * envelope * combined);
+      stereo_samples[i * 2] = value;
+      stereo_samples[i * 2 + 1] = value;
+    }
+
+    while (i2s_audio_get_free_samples() < (uint32_t)(chunk_size * 2)) {
       tight_loop_contents();
     }
-    i2s_audio_write(stereo_samples, 200);
+    i2s_audio_write(stereo_samples, chunk_size * 2);
+    sample_idx += chunk_size;
   }
+}
 
-  sleep_ms(100); // Let buffer drain
-  i2s_audio_stop();
+// ============================================================================
+// Startup Tone - Gentle two-note chord with fade
+// ============================================================================
+void i2s_play_test_tone(void) {
+  bool was_active = i2s_audio_is_active();
+  if (!was_active)
+    i2s_audio_start();
+
+  // C5 (523Hz) + E5 (659Hz) = pleasant major third, quiet and short
+  play_tone_segment(523.0f, 659.0f, 200, 800, true);
+  sleep_ms(80);
+
+  if (!was_active)
+    i2s_audio_stop();
+}
+
+// ============================================================================
+// Connected Sound - Rising two-tone (boop-boop up)
+// ============================================================================
+void i2s_play_connected(void) {
+  bool was_active = i2s_audio_is_active();
+  if (!was_active)
+    i2s_audio_start();
+
+  play_tone_segment(440.0f, 0, 60, 600, false); // A4
+  sleep_ms(40);
+  play_tone_segment(554.0f, 0, 80, 600, true); // C#5 (higher)
+  sleep_ms(50);
+
+  if (!was_active)
+    i2s_audio_stop();
+}
+
+// ============================================================================
+// Disconnected Sound - Falling two-tone (boop-boop down)
+// ============================================================================
+void i2s_play_disconnected(void) {
+  bool was_active = i2s_audio_is_active();
+  if (!was_active)
+    i2s_audio_start();
+
+  play_tone_segment(554.0f, 0, 60, 600, false); // C#5
+  sleep_ms(40);
+  play_tone_segment(440.0f, 0, 80, 600, true); // A4 (lower)
+  sleep_ms(50);
+
+  if (!was_active)
+    i2s_audio_stop();
+}
+
+// ============================================================================
+// Pairing Mode Beep - Short single beep (keep I2S running)
+// ============================================================================
+void i2s_play_pairing_beep(void) {
+  bool was_active = i2s_audio_is_active();
+  if (!was_active)
+    i2s_audio_start();
+
+  play_tone_segment(880.0f, 0, 50, 500, true); // A5 - short quiet beep
+  sleep_ms(40);
+
+  // Note: Don't stop I2S here - keep it running for smoother sound
+  // It will be stopped when pairing mode ends or device connects
+  if (!was_active) {
+    // Actually, let's keep it running to avoid pops between beeps
+    // i2s_audio_stop();
+  }
 }
 
 // ============================================================================

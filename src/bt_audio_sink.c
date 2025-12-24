@@ -4,6 +4,7 @@
 #include "i2s_audio.h"
 #include "pico/cyw43_arch.h"
 #include <stdio.h>
+#include <string.h>
 
 // A2DP sink state
 static uint8_t a2dp_local_seid = 0;
@@ -11,17 +12,75 @@ static uint16_t a2dp_cid = 0;
 static uint8_t avrcp_connected = 0;
 static uint8_t media_initialized = 0;
 
+// Auto-reconnect: last connected device
+static bd_addr_t last_connected_addr;
+static bool has_last_device = false;
+static btstack_timer_source_t reconnect_timer;
+
 // Volume control (0-127, default 100 = ~79%)
 static uint8_t audio_volume = 100;
 
 // Debug counters
 static uint32_t total_pcm_samples = 0;
 static uint32_t total_media_packets = 0;
+static uint32_t last_pcm_samples = 0;
+static uint32_t last_media_packets = 0;
 static bool sample_rate_set = false;
 
-// SBC configuration
+// Status timer
+static btstack_timer_source_t status_timer;
+static bool status_timer_active = false;
+
+// Watchdog: consecutive times we've seen media arrive but no PCM output
+static uint32_t decoder_stall_count = 0;
+
+// SBC configuration (must be before status_timer_handler)
 static btstack_sbc_decoder_state_t sbc_decoder_state;
 static int16_t pcm_buffer[256 * 2]; // Max SBC frame = 256 samples stereo
+
+// SBC decode callback forward declaration
+static void sbc_decode_callback(int16_t *pcm_data, int num_samples,
+                                int num_channels, int sample_rate,
+                                void *context);
+
+static void status_timer_handler(btstack_timer_source_t *ts) {
+  (void)ts;
+  if (!status_timer_active)
+    return;
+
+  uint32_t pcm_delta = total_pcm_samples - last_pcm_samples;
+  uint32_t media_delta = total_media_packets - last_media_packets;
+
+  uint32_t dma_irq, ring_level;
+  i2s_audio_get_stats(&dma_irq, &ring_level);
+
+  printf("[STAT] media=%u pcm=%u dma=%u ring=%u (d: m=%u p=%u)\n",
+         total_media_packets, total_pcm_samples, dma_irq, ring_level,
+         media_delta, pcm_delta);
+
+  // WATCHDOG: Detect decoder stall (media arriving but no PCM output)
+  if (media_delta > 10 && pcm_delta == 0) {
+    decoder_stall_count++;
+    printf("[WARN] Decoder stall detected! media=%u, pcm=0 (count=%u)\n",
+           media_delta, decoder_stall_count);
+
+    // After 2 consecutive stalls, force reinit decoder
+    if (decoder_stall_count >= 2) {
+      printf("[WARN] Reinitializing SBC decoder...\n");
+      btstack_sbc_decoder_init(&sbc_decoder_state, SBC_MODE_STANDARD,
+                               sbc_decode_callback, NULL);
+      decoder_stall_count = 0;
+    }
+  } else {
+    decoder_stall_count = 0; // Reset if normal
+  }
+
+  last_pcm_samples = total_pcm_samples;
+  last_media_packets = total_media_packets;
+
+  btstack_run_loop_set_timer(&status_timer, 5000);
+  btstack_run_loop_add_timer(&status_timer);
+}
 
 // Packet handler forward declaration
 static void packet_handler(uint8_t packet_type, uint16_t channel,
@@ -68,7 +127,15 @@ static void a2dp_sink_packet_handler(uint8_t packet_type, uint16_t channel,
       }
       a2dp_cid =
           a2dp_subevent_signaling_connection_established_get_a2dp_cid(packet);
-      printf("[A2DP] Connection established, cid 0x%04x\n", a2dp_cid);
+
+      // Save remote address for auto-reconnect
+      a2dp_subevent_signaling_connection_established_get_bd_addr(
+          packet, last_connected_addr);
+      has_last_device = true;
+
+      printf("[A2DP] Connected to %s, cid 0x%04x\n",
+             bd_addr_to_str(last_connected_addr), a2dp_cid);
+      i2s_play_connected(); // Play connected sound
       break;
 
     case A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_SBC_CONFIGURATION: {
@@ -104,7 +171,13 @@ static void a2dp_sink_packet_handler(uint8_t packet_type, uint16_t channel,
     case A2DP_SUBEVENT_STREAM_STARTED:
       printf("[A2DP] Stream started\n");
       sample_rate_set = false; // Reset to detect rate on this stream
+      decoder_stall_count = 0; // Reset watchdog counter
       i2s_audio_start();
+      // Start status timer
+      status_timer_active = true;
+      btstack_run_loop_set_timer_handler(&status_timer, status_timer_handler);
+      btstack_run_loop_set_timer(&status_timer, 5000);
+      btstack_run_loop_add_timer(&status_timer);
       break;
 
     case A2DP_SUBEVENT_STREAM_SUSPENDED:
@@ -114,6 +187,8 @@ static void a2dp_sink_packet_handler(uint8_t packet_type, uint16_t channel,
 
     case A2DP_SUBEVENT_STREAM_STOPPED:
       printf("[A2DP] Stream stopped\n");
+      status_timer_active = false;
+      btstack_run_loop_remove_timer(&status_timer);
       i2s_audio_stop();
       break;
 
@@ -124,6 +199,7 @@ static void a2dp_sink_packet_handler(uint8_t packet_type, uint16_t channel,
 
     case A2DP_SUBEVENT_SIGNALING_CONNECTION_RELEASED:
       printf("[A2DP] Connection released\n");
+      i2s_play_disconnected(); // Play disconnected sound
       a2dp_cid = 0;
       // Reset state for clean reconnection
       total_pcm_samples = 0;
@@ -315,6 +391,58 @@ void bt_audio_sink_init(void) {
   gap_connectable_control(1);
 
   printf("Bluetooth A2DP Sink ready - discoverable as 'Pico Audio Receiver'\n");
+}
+
+// ============================================================================
+// Auto-Reconnect: Timer handler to connect to last device
+// ============================================================================
+static void reconnect_timer_handler(btstack_timer_source_t *ts) {
+  (void)ts;
+
+  if (a2dp_cid != 0) {
+    printf("[RECONNECT] Already connected, skipping\n");
+    return;
+  }
+
+  if (!has_last_device) {
+    printf("[RECONNECT] No previous device saved\n");
+    return;
+  }
+
+  printf("[RECONNECT] Attempting to connect to %s...\n",
+         bd_addr_to_str(last_connected_addr));
+
+  uint16_t cid;
+  uint8_t status = a2dp_sink_establish_stream(last_connected_addr, &cid);
+
+  if (status == ERROR_CODE_SUCCESS) {
+    printf("[RECONNECT] Connection initiated, cid 0x%04x\n", cid);
+  } else {
+    printf("[RECONNECT] Failed to initiate, status 0x%02x\n", status);
+    // Retry in 5 seconds
+    btstack_run_loop_set_timer(&reconnect_timer, 5000);
+    btstack_run_loop_add_timer(&reconnect_timer);
+  }
+}
+
+void bt_audio_sink_reconnect_last(void) {
+  if (has_last_device) {
+    printf("[RECONNECT] Manual reconnect to %s\n",
+           bd_addr_to_str(last_connected_addr));
+    // Schedule immediate reconnect
+    btstack_run_loop_set_timer_handler(&reconnect_timer,
+                                       reconnect_timer_handler);
+    btstack_run_loop_set_timer(&reconnect_timer, 100);
+    btstack_run_loop_add_timer(&reconnect_timer);
+  }
+}
+
+void bt_audio_sink_schedule_reconnect(void) {
+  // Schedule reconnect attempt 2 seconds after boot
+  printf("[RECONNECT] Scheduling auto-reconnect in 2 seconds...\n");
+  btstack_run_loop_set_timer_handler(&reconnect_timer, reconnect_timer_handler);
+  btstack_run_loop_set_timer(&reconnect_timer, 2000);
+  btstack_run_loop_add_timer(&reconnect_timer);
 }
 
 void bt_audio_sink_process(void) {

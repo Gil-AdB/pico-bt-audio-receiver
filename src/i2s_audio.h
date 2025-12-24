@@ -33,8 +33,16 @@ bool i2s_audio_is_active(void);
 // Set sample rate (44100 or 48000)
 void i2s_audio_set_sample_rate(uint32_t rate);
 
+// Get diagnostic stats (for debugging)
+void i2s_audio_get_stats(uint32_t *dma_irq_count, uint32_t *ring_buffer_level);
+
 // Play test tone (440Hz for 2 seconds)
 void i2s_play_test_tone(void);
+
+// Sound feedback
+void i2s_play_connected(void);
+void i2s_play_disconnected(void);
+void i2s_play_pairing_beep(void);
 
 // Direct PIO test (no DMA) - for debugging GPIO/PIO issues
 void i2s_direct_test(void);

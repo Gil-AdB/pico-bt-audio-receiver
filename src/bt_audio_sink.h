@@ -13,4 +13,8 @@ void bt_audio_sink_process(void);
 // Get connection status
 int bt_audio_sink_is_connected(void);
 
+// Auto-reconnect to last connected device
+void bt_audio_sink_schedule_reconnect(void);
+void bt_audio_sink_reconnect_last(void);
+
 #endif // BT_AUDIO_SINK_H
