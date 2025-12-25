@@ -73,7 +73,12 @@ static bool __not_in_flash_func(get_bootsel_button)(void) {
     ;
 
   // Read the button state (inverted - button pressed = low = true)
+#if PICO_RP2040
   bool button_state = !(sio_hw->gpio_hi_in & (1u << CS_PIN_INDEX));
+#else
+  // For RP2350 (Pico 2)
+  bool button_state = !(sio_hw->gpio_hi_in & SIO_GPIO_HI_IN_QSPI_CSN_BITS);
+#endif
 
   // Restore the CS pin to normal operation
   hw_write_masked(&ioqspi_hw->io[CS_PIN_INDEX].ctrl,
@@ -131,6 +136,8 @@ static void led_heartbeat_handler(btstack_timer_source_t *ts) {
 // BOOTSEL button checker - runs every 100ms
 // ============================================================================
 static uint32_t bootsel_check_count = 0;
+// Add a flag to ensure we only trigger the action once per press
+static bool bootsel_handled = false;
 
 static void check_bootsel_button(btstack_timer_source_t *ts) {
   (void)ts;
@@ -148,18 +155,23 @@ static void check_bootsel_button(btstack_timer_source_t *ts) {
       // Button just pressed
       bootsel_was_pressed = true;
       bootsel_press_start = to_ms_since_boot(get_absolute_time());
+      bootsel_handled = false; // Reset handled flag
       printf("[BOOTSEL] Button pressed!\n");
     } else {
       // Button still held - check for 3 second hold
       uint32_t held_time =
           to_ms_since_boot(get_absolute_time()) - bootsel_press_start;
-      if (held_time >= 3000 && !pairing_mode) {
+
+      // Only trigger if we haven't handled this press yet
+      if (held_time >= 3000 && !pairing_mode && !bootsel_handled) {
         printf("[BOOTSEL] Held for 3 seconds - entering pairing mode\n");
         enter_pairing_mode();
+        bootsel_handled = true; // Mark as handled so we don't re-trigger
       }
     }
   } else {
     bootsel_was_pressed = false;
+    bootsel_handled = false;
   }
 
   btstack_run_loop_set_timer(&bootsel_timer, 100);
@@ -218,6 +230,13 @@ static void enter_pairing_mode(void) {
   pairing_mode = true;
   pairing_mode_start_time = to_ms_since_boot(get_absolute_time());
 
+  // Force disconnect if currently connected
+  if (bt_audio_sink_is_connected()) {
+    printf("[PAIRING] Force disconnecting current device...\n");
+    extern void bt_audio_sink_disconnect(void);
+    bt_audio_sink_disconnect();
+  }
+
   // Make discoverable AND connectable
   gap_discoverable_control(1);
   gap_connectable_control(1);
@@ -259,10 +278,10 @@ static void main_packet_handler(uint8_t packet_type, uint16_t channel,
     if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING) {
       printf("[MAIN] HCI working - starting timers\n");
 
-      // DISABLED: User reported crackling/stuck (QSPI conflict)
-      // start_bootsel_timer();
+      // Start BOOTSEL button polling (Detection fixed for RP2350)
+      start_bootsel_timer();
 
-      // Schedule auto-reconnect
+      // Schedule auto-reconnect if we have a saved device
       extern void bt_audio_sink_reconnect_last(void);
       bt_audio_sink_reconnect_last();
     }

@@ -471,8 +471,15 @@ static void reconnect_timer_handler(btstack_timer_source_t *ts) {
   } else {
     printf("[RECONNECT] Failed to initiate, status 0x%02x\n", status);
     // Retry in 5 seconds
-    btstack_run_loop_set_timer(&reconnect_timer, 5000);
+    btstack_run_loop_set_timer(&reconnect_timer, 2000);
     btstack_run_loop_add_timer(&reconnect_timer);
+  }
+}
+
+void bt_audio_sink_disconnect(void) {
+  if (a2dp_cid != 0) {
+    printf("[BT] Force disconnecting CID 0x%04x\n", a2dp_cid);
+    a2dp_sink_disconnect(a2dp_cid);
   }
 }
 

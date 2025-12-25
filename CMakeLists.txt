@@ -13,6 +13,9 @@ pico_sdk_init()
 
 add_executable(${PROJECT_NAME})
 
+# Run entire application from RAM to avoid Flash XIP conflicts (Audio Glitches/Hangs)
+pico_set_binary_type(${PROJECT_NAME} copy_to_ram)
+
 target_sources(${PROJECT_NAME} PRIVATE
     src/main.c
     src/bt_audio_sink.c
@@ -43,6 +46,6 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
     CYW43_LWIP=0
 )
 
-pico_enable_stdio_usb(${PROJECT_NAME} 1)
+#pico_enable_stdio_usb(${PROJECT_NAME} 1)
 pico_enable_stdio_uart(${PROJECT_NAME} 1)
 pico_add_extra_outputs(${PROJECT_NAME})
