@@ -18,6 +18,9 @@
 // Initialize I2S output
 void i2s_audio_init(void);
 
+// Clear audio buffers (call before starting new stream)
+void i2s_audio_clear_buffers(void);
+
 // Write PCM samples (interleaved stereo, 16-bit signed)
 // Returns number of samples written
 uint32_t i2s_audio_write(const int16_t *samples, uint32_t num_samples);

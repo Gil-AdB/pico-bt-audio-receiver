@@ -14,6 +14,10 @@ static uint16_t a2dp_cid = 0;
 static uint8_t avrcp_connected = 0;
 static uint8_t media_initialized = 0;
 
+// ACL connection handle for hard disconnect
+static hci_con_handle_t connection_handle = HCI_CON_HANDLE_INVALID;
+static btstack_packet_callback_registration_t hci_event_callback_registration;
+
 // Auto-reconnect: last connected device
 static bd_addr_t last_connected_addr;
 static bool has_last_device = false;
@@ -193,8 +197,13 @@ static void a2dp_sink_packet_handler(uint8_t packet_type, uint16_t channel,
       else if (sampling_freq & 0x80)
         sample_rate = 16000;
 
-      i2s_audio_set_sample_rate(sample_rate);
-      printf("[A2DP] SBC configured: %u Hz\n", sample_rate);
+      // NOTE: We do NOT set the sample rate here anymore.
+      // 1. The phone often negotiates 32kHz (0x40) but sends 44.1kHz frames.
+      // 2. Switching PIO clock to 32k and back causes glitches or state issues.
+      // We wait for the first decoded frame in sbc_decode_callback to set the
+      // rate. i2s_audio_set_sample_rate(sample_rate);
+      printf("[A2DP] SBC configured: %u Hz (Deferred setting to I2S)\n",
+             sample_rate);
       break;
     }
 
@@ -214,9 +223,12 @@ static void a2dp_sink_packet_handler(uint8_t packet_type, uint16_t channel,
       decoder_stall_count = 0; // Reset watchdog counter
 
       // Reset SBC decoder to clear any stale state from previous stream
+      memset(&sbc_decoder_state, 0, sizeof(sbc_decoder_state));
       btstack_sbc_decoder_init(&sbc_decoder_state, SBC_MODE_STANDARD,
                                sbc_decode_callback, NULL);
 
+      // Ensure ring buffer is empty before starting new playback
+      i2s_audio_clear_buffers();
       i2s_audio_start();
       // Start status timer
       status_timer_active = true;
@@ -370,6 +382,29 @@ static void avrcp_packet_handler(uint8_t packet_type, uint16_t channel,
   }
 }
 
+static void hci_packet_handler(uint8_t packet_type, uint16_t channel,
+                               uint8_t *packet, uint16_t size) {
+  (void)channel;
+  (void)size;
+  if (packet_type != HCI_EVENT_PACKET)
+    return;
+
+  switch (hci_event_packet_get_type(packet)) {
+  case HCI_EVENT_CONNECTION_COMPLETE:
+    if (hci_event_connection_complete_get_status(packet) ==
+        ERROR_CODE_SUCCESS) {
+      connection_handle =
+          hci_event_connection_complete_get_connection_handle(packet);
+      printf("[BT] ACL Connected, handle 0x%04x\n", connection_handle);
+    }
+    break;
+  case HCI_EVENT_DISCONNECTION_COMPLETE:
+    connection_handle = HCI_CON_HANDLE_INVALID;
+    printf("[BT] ACL Disconnected\n");
+    break;
+  }
+}
+
 void bt_audio_sink_init(void) {
   printf("Initializing Bluetooth A2DP Sink...\n");
 
@@ -392,7 +427,12 @@ void bt_audio_sink_init(void) {
   // Initialize A2DP Sink
   a2dp_sink_init();
   a2dp_sink_register_packet_handler(&a2dp_sink_packet_handler);
+  a2dp_sink_register_packet_handler(&a2dp_sink_packet_handler);
   a2dp_sink_register_media_handler(&media_packet_handler);
+
+  // Register for low-level HCI events to track ACL connection
+  hci_event_callback_registration.callback = &hci_packet_handler;
+  hci_add_event_handler(&hci_event_callback_registration);
 
   // Load last connected device from TLV
   load_last_device();
@@ -477,8 +517,12 @@ static void reconnect_timer_handler(btstack_timer_source_t *ts) {
 }
 
 void bt_audio_sink_disconnect(void) {
-  if (a2dp_cid != 0) {
-    printf("[BT] Force disconnecting CID 0x%04x\n", a2dp_cid);
+  if (connection_handle != HCI_CON_HANDLE_INVALID) {
+    printf("[BT] Force disconnecting ACL level (handle 0x%04x)...\n",
+           connection_handle);
+    gap_disconnect(connection_handle);
+  } else if (a2dp_cid != 0) {
+    printf("[BT] Force disconnecting A2DP CID 0x%04x\n", a2dp_cid);
     a2dp_sink_disconnect(a2dp_cid);
   }
 }

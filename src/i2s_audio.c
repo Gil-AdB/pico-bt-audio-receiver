@@ -154,6 +154,7 @@ void i2s_audio_set_sample_rate(uint32_t rate) {
 // ============================================================================
 // Initialization
 // ============================================================================
+void i2s_audio_clear_buffers(void) { ring_clear(); }
 void i2s_audio_init(void) {
   // Clear buffers
   ring_clear();
