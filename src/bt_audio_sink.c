@@ -74,7 +74,6 @@ static uint32_t decoder_stall_count = 0;
 
 // SBC configuration (must be before status_timer_handler)
 static btstack_sbc_decoder_state_t sbc_decoder_state;
-static int16_t pcm_buffer[256 * 2]; // Max SBC frame = 256 samples stereo
 
 // SBC decode callback forward declaration
 static void sbc_decode_callback(int16_t *pcm_data, int num_samples,
@@ -105,6 +104,7 @@ static void status_timer_handler(btstack_timer_source_t *ts) {
     // After 2 consecutive stalls, force reinit decoder
     if (decoder_stall_count >= 2) {
       printf("[WARN] Reinitializing SBC decoder...\n");
+      memset(&sbc_decoder_state, 0, sizeof(sbc_decoder_state));
       btstack_sbc_decoder_init(&sbc_decoder_state, SBC_MODE_STANDARD,
                                sbc_decode_callback, NULL);
       decoder_stall_count = 0;
@@ -304,8 +304,24 @@ static void media_packet_handler(uint8_t seid, uint8_t *packet, uint16_t size) {
 
   total_media_packets++;
 
+  // A2DP media packets have RTP header (12 bytes) + media payload header (1 byte)
+  // We must skip these to get to actual SBC data
+  // RTP header: 12 bytes (V=2, P, X, CC, M, PT, seq, timestamp, SSRC)
+  // Media payload header: 1 byte (number of SBC frames, fragmentation flags)
+  const uint8_t rtp_header_size = 12;
+  const uint8_t media_payload_header_size = 1;
+  const uint8_t total_header_size = rtp_header_size + media_payload_header_size;
+
+  if (size <= total_header_size) {
+    // Packet too small to contain SBC data
+    return;
+  }
+
+  const uint8_t *sbc_data = packet + total_header_size;
+  uint16_t sbc_size = size - total_header_size;
+
   // Decode SBC frames
-  btstack_sbc_decoder_process_data(&sbc_decoder_state, 0, packet, size);
+  btstack_sbc_decoder_process_data(&sbc_decoder_state, 0, sbc_data, sbc_size);
 }
 
 static void avrcp_packet_handler(uint8_t packet_type, uint16_t channel,
